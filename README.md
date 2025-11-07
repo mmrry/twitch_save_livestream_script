@@ -22,6 +22,11 @@ TTV-LOL-PRO v1 servers:
 * https://lb-as.cdn-perfprod.com (Asia)
 * https://lb-sa.cdn-perfprod.com (SA)
 
+luminous-ttv servers:
+* https://eu.luminous.dev (Europe 1)
+* https://eu2.luminous.dev (Europe 2)
+* https://as.luminous.dev (Asia)
+
 Current wait time (in seconds):
 * MIN_WAIT = 2
 * MAX_WAIT = 11

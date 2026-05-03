@@ -12,6 +12,7 @@ Have options:
 
 For `twitch-proxy-playlist` option _(TTV-LOL-PRO v1)_ you need to patch streamlink - https://github.com/2bc4/streamlink-ttvlol
 
+https://wiki.cdn-perfprod.com/v1/must-read/proxies
 TTV-LOL-PRO v1 servers:
 * https://lb-eu.cdn-perfprod.com (Europe)
 * https://lb-eu2.cdn-perfprod.com (Europe 2)

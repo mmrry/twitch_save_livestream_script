@@ -95,7 +95,7 @@ def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None
             filename_format = r"{time:%Y%m%d %H-%M-%S} [" + author_name + r"] " + clean_title + r" [" + quality + r"][{id}].ts"
 
             cmd = [
-                "streamlink", "--twitch-low-latency", "--twitch-disable-ads", "--twitch-low-latency", "--twitch-disable-ads", "--stream-segment-threads", "3", "--hls-live-restart", "--stream-segment-timeout", "15", "--stream-segment-attempts", "10", "-o", filename_format,
+                "streamlink", "--twitch-disable-ads", "--twitch-low-latency", "--stream-segment-threads", "3", "--hls-live-restart", "--stream-segment-timeout", "15", "--stream-segment-attempts", "10", "-o", filename_format,
                 uri, quality
             ]
             if proxy:

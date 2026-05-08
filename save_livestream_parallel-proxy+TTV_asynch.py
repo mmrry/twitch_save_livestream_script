@@ -111,7 +111,7 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
             if twitch_proxy_playlist:
                 info_cmd.insert(1, f"--twitch-proxy-playlist={twitch_proxy_playlist}")
  
-            returncode, stdout, _ = await run_streamlink(info_cmd, timeout=10)
+            returncode, stdout, info_stderr = await run_streamlink(info_cmd, timeout=10)
             if returncode != 0:
                 # HTTP сказал онлайн, streamlink не смог — редко, просто ждём
                 await asyncio.sleep(int(uniform(MIN_WAIT, MAX_WAIT)))
@@ -138,6 +138,8 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
             try:
                 await asyncio.to_thread(log_file.write,
                     f"{current_time} Starting recording for {author_name} ({clean_title})\n")
+                if info_stderr:
+                    await asyncio.to_thread(log_file.write, info_stderr)
  
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -147,7 +149,12 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
  
                 async def pipe_to_log(stream):
                     async for line in stream:
-                        await asyncio.to_thread(log_file.write, line.decode(errors='replace'))
+                        try:
+                            decoded = line.decode('utf-8')
+                        except UnicodeDecodeError:
+                            decoded = line.decode('cp1251', errors='replace')
+                        await asyncio.to_thread(log_file.write, decoded)
+                        await asyncio.to_thread(log_file.flush)
  
                 await asyncio.gather(
                     pipe_to_log(proc.stdout),

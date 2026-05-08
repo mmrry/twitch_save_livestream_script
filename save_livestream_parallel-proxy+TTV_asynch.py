@@ -134,12 +134,12 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
  
             print(f"{current_time} LIVE {author_name}. Recording: {clean_title}", flush=True)
  
-            log_file = await asyncio.to_thread(open, log_filename, "a", encoding='utf-8')
+            # open() на локальном файле — быстро, asyncio.to_thread не нужен
+            log_file = open(log_filename, "a", encoding='utf-8')
             try:
-                await asyncio.to_thread(log_file.write,
-                    f"{current_time} Starting recording for {author_name} ({clean_title})\n")
+                log_file.write(f"{current_time} Starting recording for {author_name} ({clean_title})\n")
                 if info_stderr:
-                    await asyncio.to_thread(log_file.write, info_stderr)
+                    log_file.write(info_stderr)
  
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -147,23 +147,30 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
                     stderr=asyncio.subprocess.PIPE
                 )
  
+                # write/flush на буферизованном файле = memcpy в буфер ОС, микросекунды,
+                # event loop не блокирует — asyncio.to_thread здесь избыточен.
+                # flush каждые 10 строк: баланс между актуальностью лога и syscall-нагрузкой
                 async def pipe_to_log(stream):
+                    line_count = 0
                     async for line in stream:
                         try:
                             decoded = line.decode('utf-8')
                         except UnicodeDecodeError:
                             decoded = line.decode('cp1251', errors='replace')
-                        await asyncio.to_thread(log_file.write, decoded)
-                        await asyncio.to_thread(log_file.flush)
+                        log_file.write(decoded)
+                        line_count += 1
+                        if line_count % 10 == 0:
+                            log_file.flush()
  
                 await asyncio.gather(
                     pipe_to_log(proc.stdout),
                     pipe_to_log(proc.stderr)
                 )
                 await proc.wait()
-                await asyncio.to_thread(log_file.write, f"{timestamp()} Finished recording\n\n")
+                log_file.write(f"{timestamp()} Finished recording\n\n")
+                log_file.flush()
             finally:
-                await asyncio.to_thread(log_file.close)
+                log_file.close()
  
         except json.JSONDecodeError as e:
             await log_error(f"{author_name} — ERROR parsing stream info: {str(e)}")

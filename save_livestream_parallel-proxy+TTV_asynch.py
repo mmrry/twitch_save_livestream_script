@@ -45,7 +45,7 @@ async def log_error(message: str):
             err_log.write(f"{timestamp()} {message}\n")
     await asyncio.to_thread(_write)
  
-def _check_twitch_gql(author_name: str) -> bool:
+def _check_twitch_gql(author_name: str) -> tuple[bool, str]:
     url = "https://gql.twitch.tv/gql"
     payload = json.dumps([{
         "operationName": "StreamMetadata",
@@ -62,13 +62,17 @@ def _check_twitch_gql(author_name: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
+            stream = data[0]["data"]["user"]["stream"]
             # stream == null если офлайн, object если онлайн
-            return data[0]["data"]["user"]["stream"] is not None
+            if stream is None:
+                return False, ""
+            # title берём прямо из GQL — отдельный вызов streamlink --json не нужен
+            return True, stream.get("title", "")
     except Exception:
-        return False
+        return False, ""
  
 # Вместо is_stream_live через streamlink subprocess:
-async def is_stream_live_fast(author_name: str) -> bool:
+async def is_stream_live_fast(author_name: str) -> tuple[bool, str]:
     # asyncio.to_thread — urllib не блокирует event loop
     return await asyncio.to_thread(_check_twitch_gql, author_name)
  
@@ -93,33 +97,17 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
  
     while True:
         # ← лёгкая проверка: просто HTTP GET, никаких subprocess
-        if not await is_stream_live_fast(author_name):
+        is_live, title = await is_stream_live_fast(author_name)
+        if not is_live:
             wait_time = int(uniform(MIN_WAIT, MAX_WAIT))
             print(f"{timestamp()} Stream is offline {author_name}. Waiting {wait_time} sec...", flush=True)
             await asyncio.sleep(wait_time)
             continue
  
-        # стрим онлайн — теперь запускаем тяжёлый streamlink
+        # стрим онлайн — title уже получен из GQL, streamlink --json не нужен
         current_time = timestamp()
         try:
-            info_cmd = [
-                "streamlink", "--json", "--twitch-low-latency", "--twitch-disable-ads", "--stream-segment-threads", "3", "--hls-live-restart", "--stream-segment-timeout", "15", "--stream-segment-attempts", "10",
-                uri, quality
-            ]
-            if proxy:
-                info_cmd.insert(1, f"--http-proxy={proxy}")
-            if twitch_proxy_playlist:
-                info_cmd.insert(1, f"--twitch-proxy-playlist={twitch_proxy_playlist}")
- 
-            returncode, stdout, info_stderr = await run_streamlink(info_cmd, timeout=10)
-            if returncode != 0:
-                # HTTP сказал онлайн, streamlink не смог — редко, просто ждём
-                await asyncio.sleep(int(uniform(MIN_WAIT, MAX_WAIT)))
-                continue
- 
-            stream_info = json.loads(stdout)
-            original_title = stream_info.get('metadata', {}).get('title', 'no_title')
-            clean_title = sanitize_filename_windows(original_title)
+            clean_title = sanitize_filename_windows(title)
  
             filename_format = r"{time:%Y%m%d %H-%M-%S} [" + author_name + r"] " + clean_title + r" [" + quality + r"][{id}].ts"
  
@@ -138,8 +126,6 @@ async def download(author_name, quality="best", proxy=None, twitch_proxy_playlis
             log_file = open(log_filename, "a", encoding='utf-8')
             try:
                 log_file.write(f"{current_time} Starting recording for {author_name} ({clean_title})\n")
-                if info_stderr:
-                    log_file.write(info_stderr)
  
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,

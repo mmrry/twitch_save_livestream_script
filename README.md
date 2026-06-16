@@ -64,4 +64,4 @@ $ python3 save_livestream_parallel.py [--proxy http://IP:PORT] [--twitch-proxy-p
 ```
 
 ### To Do:
-* save_livestream_parallel-proxy+TTV.py: check twitch-proxy-playlist if its get real data 
+* save_livestream_parallel-proxy+TTV.py: check --twitch-proxy-playlist and --proxy if its get real data and alive 

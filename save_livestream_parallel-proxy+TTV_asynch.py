@@ -8,6 +8,9 @@ streamlink отдаёт поток в --stdout, этот скрипт читае
 переполненный stdout, продолжает качать сегменты и не теряет HLS-окно.
 Back-pressure включается только когда буфер реально забит; каждое такое
 залипание считается и пишется в лог вместе с пиком буфера.
+Дополнительно:
+  * watchdog: если streamlink завис и не шлёт данные NO_DATA_TIMEOUT секунд,
+    он убивается целиком (с дочерними процессами) и файл закрывается.
 """
 
 import sys
@@ -21,7 +24,6 @@ import collections
 from multiprocessing import Process
 from random import uniform
 from time import gmtime, strftime, time as now_ts
-from pathlib import Path
 
 MIN_WAIT = 2
 MAX_WAIT = 11
@@ -30,6 +32,10 @@ CHUNK = 1 << 20          # сколько читаем из пайпа за ра
 MIB = 1 << 20
 BUFFER_MB = 512          # буфер в ОЗУ по умолчанию, MiB (на каждого стримера)
 DRAIN_TIMEOUT = 120      # сколько ждём, пока диск дожуёт буфер при закрытии
+NO_DATA_TIMEOUT = 120    # нет данных от streamlink столько секунд -> убиваем
+KILL_GRACE = 15          # сколько ждём мирного выхода streamlink
+
+IS_WINDOWS = os.name == "nt"
 
 INVALID_CHARS = r'<>:"/\\|?*'
 RESERVED_NAMES = {
@@ -66,27 +72,55 @@ def log_error(message: str):
 
 
 # =============================================================================
+#  Управление процессами
+# =============================================================================
+
+def kill_tree(p):
+    """Убить процесс вместе с детьми.
+
+    На Windows streamlink.exe — лаунчер, внутри которого живёт отдельный
+    python; p.kill() может убить только лаунчер, а пайп останется открыт
+    у дочернего процесса. taskkill /T убивает всё дерево.
+    """
+    if p.poll() is not None:
+        return
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+def stop_proc(p, grace=KILL_GRACE):
+    """Дождаться выхода процесса, при необходимости добить. Возвращает rc."""
+    try:
+        return p.wait(grace)
+    except subprocess.TimeoutExpired:
+        pass
+    kill_tree(p)
+    try:
+        return p.wait(10)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+# =============================================================================
 #  Запись на диск отдельным потоком
 # =============================================================================
 
 class BufferedFileWriter:
-    """Пишет на диск из отдельного потока. Очередь в ОЗУ гасит залипания ФС.
-
-    Буфер ограничен по БАЙТАМ, а не по числу кусков: чтение из пайпа отдаёт
-    куски произвольного размера, и лимит «в штуках» ничего не гарантирует.
-
-    buffering=0 намеренно: буфер у нас свой, лишний слой только маскирует
-    задержки, которые мы как раз хотим измерять.
-    """
+    """Пишет на диск из отдельного потока. Очередь в ОЗУ гасит залипания ФС."""
 
     def __init__(self, path, buffer_mb=BUFFER_MB, mode="wb"):
         self.path = path
         self.limit = max(8, int(buffer_mb)) * MIB
-        self.written = 0            # байт реально отдано ядру
-        self.queued = 0             # байт принято в буфер
-        self.stalls = 0             # сколько раз упёрлись в потолок буфера
-        self.stall_seconds = 0.0    # суммарное ожидание диска
-        self.max_depth = 0          # пик занятости буфера, байт
+        self.written = 0
+        self.queued = 0
+        self.stalls = 0
+        self.stall_seconds = 0.0
+        self.max_depth = 0
         self.error = None
         self._q = collections.deque()
         self._depth = 0
@@ -96,8 +130,6 @@ class BufferedFileWriter:
         self._t = threading.Thread(target=self._run, name="disk-writer",
                                    daemon=True)
         self._t.start()
-
-    # ---- поток диска --------------------------------------------------------
 
     def _run(self):
         try:
@@ -125,7 +157,6 @@ class BufferedFileWriter:
             print(f"{timestamp()} ОШИБКА записи на диск "
                   f"{os.path.basename(self.path)}: {e!r}", flush=True)
             log_error(f"disk write error {self.path}: {e!r}")
-            # разбудить всех, кто ждёт места: буфер всё равно мёртв
             with self._cv:
                 self._q.clear()
                 self._depth = 0
@@ -136,8 +167,6 @@ class BufferedFileWriter:
                 self._f.close()
             except Exception:
                 pass
-
-    # ---- сторона продьюсера -------------------------------------------------
 
     @property
     def depth(self):
@@ -152,13 +181,11 @@ class BufferedFileWriter:
         self._cv.notify()
 
     def feed_nowait(self, chunk) -> bool:
-        """True — кусок в буфере, False — буфер полон (ждать придётся)."""
         if self.error:
             raise RuntimeError(f"поток записи мёртв: {self.error!r}")
         with self._cv:
             if self._eof:
                 raise RuntimeError("поток записи закрыт")
-            # кусок больше лимита всё равно проходит, если буфер пуст
             if self._depth and self._depth + len(chunk) > self.limit:
                 self.stalls += 1
                 return False
@@ -166,7 +193,6 @@ class BufferedFileWriter:
         return True
 
     def feed(self, chunk):
-        """Блокирующий вариант — back-pressure, когда буфер забит."""
         started = now_ts()
         with self._cv:
             while (not self.error and not self._eof and self._depth
@@ -180,7 +206,6 @@ class BufferedFileWriter:
         self.stall_seconds += now_ts() - started
 
     def close(self, timeout=DRAIN_TIMEOUT) -> bool:
-        """Дописать буфер и остановить поток. False — не успел за timeout."""
         with self._cv:
             self._eof = True
             self._cv.notify_all()
@@ -199,6 +224,7 @@ COMMON_OPTS = [
     "--hls-live-restart",
     "--stream-segment-timeout", "15",
     "--stream-segment-attempts", "10",
+    "--stream-timeout", "60",
 ]
 
 def with_proxy(cmd, proxy, twitch_proxy_playlist):
@@ -216,7 +242,7 @@ def is_stream_live(author_name, quality="best", proxy=None, twitch_proxy_playlis
     ], proxy, twitch_proxy_playlist)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return False
@@ -225,51 +251,80 @@ def is_stream_live(author_name, quality="best", proxy=None, twitch_proxy_playlis
 def pump(cmd, path, buffer_mb, log_file, author_name):
     """Одна запись: streamlink -> пайп -> буфер в ОЗУ -> поток диска.
 
-    Возвращает (rc, writer, длительность в секундах).
+    Возвращает (rc, writer, длительность в секундах, hung).
     """
     writer = BufferedFileWriter(path, buffer_mb)
     started = now_ts()
     warned = False
 
+    state = {"last_data": now_ts(), "disk_wait": False, "hung": False}
+    done = threading.Event()
+
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_file, bufsize=0)
+
+    def watchdog():
+        while not done.wait(5):
+            if state["disk_wait"]:
+                continue            # стоим из-за диска, streamlink не виноват
+            idle = now_ts() - state["last_data"]
+            if idle > NO_DATA_TIMEOUT:
+                state["hung"] = True
+                msg = (f"{author_name}: нет данных от streamlink {idle:.0f} c "
+                       f"— завершаю процесс и закрываю файл")
+                print(f"{timestamp()} {msg}", flush=True)
+                log_error(msg)
+                kill_tree(p)
+                return
+
+    threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
+
     try:
         while True:
             chunk = p.stdout.read(CHUNK)
             if not chunk:
                 break
+            state["last_data"] = now_ts()
             try:
                 if writer.feed_nowait(chunk):
                     continue
             except RuntimeError:
-                # диск умер — тянуть поток дальше бессмысленно
-                p.terminate()
+                kill_tree(p)
                 break
             if not warned:
                 warned = True
                 print(f"{timestamp()} {author_name}: буфер {buffer_mb} MiB "
                       f"заполнен — диск не успевает, ждём запись", flush=True)
+            state["disk_wait"] = True
             try:
-                writer.feed(chunk)      # back-pressure, дальше уже ничем не помочь
+                writer.feed(chunk)
             except RuntimeError:
-                p.terminate()
+                kill_tree(p)
                 break
+            finally:
+                state["disk_wait"] = False
+                state["last_data"] = now_ts()
     except KeyboardInterrupt:
         print(f"{timestamp()} {author_name}: Ctrl+C — дописываю буфер на диск",
               flush=True)
-        p.terminate()
+        kill_tree(p)
         raise
     finally:
+        done.set()
         try:
             p.stdout.close()
         except Exception:
             pass
-        rc = p.wait()
+        rc = stop_proc(p)
         if not writer.close():
             print(f"{timestamp()} {author_name}: диск не дожевал "
                   f"{writer.depth / MIB:.1f} MiB за {DRAIN_TIMEOUT} c", flush=True)
 
-    return rc, writer, now_ts() - started
+    return rc, writer, now_ts() - started, state["hung"]
 
+
+# =============================================================================
+#  Основной цикл
+# =============================================================================
 
 def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None,
              buffer_mb=BUFFER_MB, outdir="."):
@@ -280,7 +335,11 @@ def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None
         if not is_stream_live(author_name, quality, proxy, twitch_proxy_playlist):
             wait_time = int(uniform(MIN_WAIT, MAX_WAIT))
             print(f"{timestamp()} Stream is offline {author_name}. Waiting {wait_time} sec...")
-            time.sleep(wait_time)
+            try:
+                time.sleep(wait_time)
+            except KeyboardInterrupt:
+                print(f"{timestamp()} Stopped by User {author_name}.")
+                return
             continue
 
         current_time = timestamp()
@@ -289,7 +348,9 @@ def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None
                 ["streamlink", "--json"] + COMMON_OPTS + [uri, quality],
                 proxy, twitch_proxy_playlist)
 
-            info_result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=10)
+            info_result = subprocess.run(info_cmd, capture_output=True, text=True,
+                                         encoding="utf-8", errors="replace",
+                                         timeout=20)
             if info_result.returncode != 0:
                 raise subprocess.CalledProcessError(info_result.returncode, info_cmd)
 
@@ -299,8 +360,6 @@ def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None
             clean_title = sanitize_filename_windows(original_title)
             stream_id = str(meta.get('id') or '')
 
-            # имя файла собираем сами: streamlink пишет в --stdout и своих
-            # плейсхолдеров ({time}, {id}) больше не подставляет
             stamp = strftime('%Y%m%d %H-%M-%S', gmtime())
             suffix = f"[{stream_id}]" if stream_id else ""
             path = os.path.join(
@@ -319,12 +378,13 @@ def download(author_name, quality="best", proxy=None, twitch_proxy_playlist=None
                 log_file.write(f"{current_time} -> {path}\n")
                 log_file.flush()
 
-                rc, writer, elapsed = pump(cmd, path, buffer_mb, log_file, author_name)
+                rc, writer, elapsed, hung = pump(cmd, path, buffer_mb, log_file, author_name)
 
                 stats = (f"{writer.written / MIB:.1f} MiB за {elapsed / 60:.1f} мин, "
                          f"пик буфера {writer.max_depth / MIB:.1f} MiB, "
                          f"залипаний диска {writer.stalls} "
-                         f"({writer.stall_seconds:.1f} c), streamlink rc={rc}")
+                         f"({writer.stall_seconds:.1f} c), streamlink rc={rc}"
+                         f"{', убит watchdog' if hung else ''}")
                 print(f"{timestamp()} {author_name}: готово — {stats}")
                 log_file.write(f"{timestamp()} Finished recording: {stats}\n\n")
 
@@ -365,7 +425,8 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python3 save_livestream_parallel-proxy+TTV.py "
               "[--proxy http://IP:PORT] [--twitch-proxy-playlist=URL] "
-              "[--buffer-mb 512] [--outdir DIR] <streamer1> ...")
+              "[--buffer-mb 512] [--outdir DIR] "
+              "<streamer1> ...")
         sys.exit(1)
 
     proxy = None
@@ -377,23 +438,24 @@ def main():
     args = sys.argv[1:]
     i = 0
     while i < len(args):
-        if args[i] == "--proxy" and i + 1 < len(args):
+        a = args[i]
+        if a == "--proxy" and i + 1 < len(args):
             proxy = args[i + 1]
             i += 2
-        elif args[i].startswith("--twitch-proxy-playlist="):
-            twitch_proxy_playlist = args[i].split("=", 1)[1]
+        elif a.startswith("--twitch-proxy-playlist="):
+            twitch_proxy_playlist = a.split("=", 1)[1]
             i += 1
-        elif args[i] == "--buffer-mb" and i + 1 < len(args):
+        elif a == "--buffer-mb" and i + 1 < len(args):
             buffer_mb = int(args[i + 1])
             i += 2
-        elif args[i].startswith("--buffer-mb="):
-            buffer_mb = int(args[i].split("=", 1)[1])
+        elif a.startswith("--buffer-mb="):
+            buffer_mb = int(a.split("=", 1)[1])
             i += 1
-        elif args[i] == "--outdir" and i + 1 < len(args):
+        elif a == "--outdir" and i + 1 < len(args):
             outdir = args[i + 1]
             i += 2
         else:
-            streamers.append(args[i])
+            streamers.append(a)
             i += 1
 
     if not streamers:
@@ -402,7 +464,8 @@ def main():
 
     os.makedirs(outdir, exist_ok=True)
     print(f"{timestamp()} Буфер {buffer_mb} MiB на стримера | "
-          f"Out: {os.path.abspath(outdir)} | Streamers: {', '.join(streamers)}")
+          f"Out: {os.path.abspath(outdir)} | "
+          f"Streamers: {', '.join(streamers)}")
 
     processes = []
     for name in streamers:
@@ -416,9 +479,18 @@ def main():
         for p in processes:
             p.join()
     except KeyboardInterrupt:
-        print("\nStop all processes...")
+        # дочерние процессы сами получают Ctrl+C (общая консоль) и дописывают
+        # буферы — даём им на это время, и только потом убиваем
+        print("\nStop all processes... (ждём дозапись буферов)")
+        deadline = now_ts() + DRAIN_TIMEOUT + KILL_GRACE + 10
+        try:
+            for p in processes:
+                p.join(max(0.1, deadline - now_ts()))
+        except KeyboardInterrupt:
+            pass
         for p in processes:
-            p.terminate()
+            if p.is_alive():
+                p.terminate()
 
 if __name__ == '__main__':
     main()
